@@ -1,0 +1,70 @@
+{
+  "version": 2,
+  "verified_at": "2026-09-02",
+  "agent": "codex",
+  "profiles": {
+    "frontend-l1": {
+      "core": [
+        "frontend-ui-engineering"
+      ],
+      "conditional": [
+        "shadcn"
+      ]
+    },
+    "frontend-l2": {
+      "core": [
+        "impeccable"
+      ],
+      "conditional": [
+        "shadcn",
+        "vercel-react-best-practices",
+        "browser-testing-with-devtools"
+      ]
+    },
+    "frontend-l3": {
+      "core": [
+        "impeccable"
+      ],
+      "conditional": [
+        "shadcn",
+        "vercel-react-best-practices",
+        "browser-testing-with-devtools"
+      ]
+    },
+    "backend-l1": {
+      "core": [
+        "test-driven-development"
+      ],
+      "conditional": [
+        "debugging-and-error-recovery"
+      ]
+    },
+    "backend-l2": {
+      "core": [
+        "api-and-interface-design",
+        "test-driven-development",
+        "security-and-hardening"
+      ],
+      "conditional": [
+        "source-driven-development"
+      ]
+    },
+    "backend-l3": {
+      "core": [
+        "spec-driven-development",
+        "api-and-interface-design",
+        "test-driven-development",
+        "security-and-hardening"
+      ],
+      "conditional": [
+        "source-driven-development"
+      ],
+      "conditional_one_of": [
+        "differential-review",
+        "static-analysis",
+        "supply-chain-risk-auditor",
+        "sharp-edges"
+      ]
+    }
+  }
+}
