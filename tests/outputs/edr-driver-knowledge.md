@@ -1,66 +1,85 @@
 # 概念
 
-EDR 驱动通过 Windows 公开扩展点采集行为，并在接口允许的阶段控制操作。本文以 Windows 11 x64 为示例环境，串起 Ps、Ob、Cm、Minifilter 和 WFP 的注册、处理与退出。
+EDR 驱动层在进程生命周期、对象句柄授权、注册表、文件 I/O 和网络处理节点采集信息，并在接口允许的阶段实施本地访问控制。本文限定 Windows x64 的公开驱动接口，采用 Windows 11 测试虚拟机作为学习路径。
 
-## Hook、通知与过滤框架
+狭义 Hook 修改原有执行路径；系统回调登记通知函数；Minifilter 与 WFP 则提供带有对象、排序和生命周期的过滤框架。本文使用后两类机制，不涉及修改内核代码、未公开回调数组或第三方驱动内部结构。
 
-狭义 Hook 修改已有执行路径；受支持的回调由子系统主动调用；过滤框架进一步管理排序、请求完成与资源生命周期。本文讨论后两类机制，不涉及内核补丁或未公开结构。
+## 观测与控制面
 
-| 机制 | 事件对象 | 控制入口 |
-|---|---|---|
-| Ps 通知 | 进程、线程、镜像 | 进程 Ex 通知可否决创建；线程、镜像通知用于观测。 |
-| Ob 回调 | 支持对象的句柄创建、复制 | Pre 裁剪允许修改的访问权限。 |
-| Cm 回调 | 注册表操作 | Pre 拒绝或接管；Post 按契约处理结果。 |
-| Minifilter | 文件系统 I/O | 继续下发、完成或在支持路径挂起请求。 |
-| WFP | 连接授权、流、数据包 | Filter 匹配规则；Callout 执行自定义分类。 |
+| 接口或框架 | 关注对象 | 当前节点的控制方式 |
+| --- | --- | --- |
+| Ps | 进程、线程生命周期与镜像映射 | 进程 Ex 通知可修改创建状态；线程、镜像回调主要提供通知。 |
+| Ob | 受支持对象的句柄创建、复制 | Pre 削减文档允许修改的访问权限；Post 读取结果。 |
+| Cm | 注册表操作 | Pre 可拒绝操作；接管操作或改写 Post 结果须遵循输出与所有权约束。 |
+| Minifilter / FltMgr | 文件系统 I/O | 按操作类型参与 Pre/Post，放行、完成或在受支持路径挂起请求。 |
+| WFP | 网络授权、数据流与数据包 | Filter 匹配 Layer 上的条件，直接执行动作或引用 Callout。 |
 
-## 对象、句柄与授权
-
-进程对象表示内核中的进程；句柄属于某个句柄表，引用对象并携带访问权限。Ps 描述对象生命周期，Ob 参与句柄授权；随后使用已有句柄的操作通常不再触发一次 Ob 授权。
+这些入口覆盖不同语义节点。线程创建记录需要与其他证据关联后才能形成检测结论；单个回调不能证明某段行为具有恶意性。[进程与线程管理器](https://learn.microsoft.com/zh-cn/windows-hardware/drivers/kernel/windows-kernel-mode-process-and-thread-manager)、[注册表回调](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-ex_callback_function)、[文件 I/O 处理](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/processing-i-o-operations)。
 
 ```mermaid
 flowchart LR
-    A["进程 A 的句柄表"] -->|"句柄 h1：查询权限"| B["进程 B 对象"]
-    C["进程 C 的句柄表"] -->|"句柄 h2：查询、终止权限"| B
-    P["Ps 通知"] -. "B 的创建与退出" .-> B
-    O["Ob 回调"] -. "h1、h2 的创建与复制" .-> A
-    O -. "句柄授权" .-> C
+    A[应用行为] --> P[Ps 生命周期]
+    A --> O[Ob 句柄授权]
+    A --> C[Cm 注册表]
+    A --> F[FltMgr 文件 I/O]
+    A --> W[WFP 网络层]
+    P --> K[内核本地判断与字段采集]
+    O --> K
+    C --> K
+    F --> K
+    W --> K
+    S[用户态服务] -->|发布策略快照| K
+    K -->|自有数据进入有界队列| S
+    S --> R[关联分析与持久化]
 ```
+
+图中的队列和策略发布是产品架构关系；后文机制节选不实现完整事件系统，也不把用户态分析设计成所有回调的同步依赖。
+
+## 对象、句柄与身份
+
+内核进程对象表示进程实体；句柄是某个句柄表中的访问入口，携带一组授权。同一进程对象可以同时被多个权限不同的句柄引用。对象身份、调用者身份和句柄接收者身份需要分别保留。[Ob 操作参数](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_pre_operation_information)。
+
+| 操作 | Ps 生命周期侧 | Ob 授权侧 |
+| --- | --- | --- |
+| 创建进程 | 新进程创建通知 | 同一业务链还可能建立进程、线程句柄。 |
+| 打开已有进程 | 目标进程没有因此重新创建 | 创建指向目标的新句柄。 |
+| 复制已有句柄 | 目标进程没有因此重新创建 | 为接收方句柄表处理复制授权。 |
+| 使用已有句柄 | 按实际生命周期触发 | 每次使用句柄不会都重新经过句柄创建回调。 |
 
 # 开发环境
 
-使用与目标系统配套的 Visual Studio、SDK 和 WDK；签名、代码完整性及过滤实例配置决定驱动能否加载。实验在可恢复的独立虚拟机中进行。[WDK 下载与工具版本](https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk)
+开发需要配套的 Visual Studio、SDK、WDK；SDK 与 WDK 的构建号必须匹配，具体组合以[当前 WDK 支持表](https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk)为准。驱动签名、代码完整性配置、Minifilter 安装信息及 WFP 策略权限都属于运行前提。
 
-下列代码是按公开接口编写的模块片段，未编译、未加载、未运行。省略工程文件、INF、设备创建、通信和事件队列；核心判断及必要清理均在代码内。每个 Start/Stop 由生命周期协调者在 `PASSIVE_LEVEL` 串行调用，同一模块只注册一次；传入的配置已经校验，字符串及上下文在注销完成前保持有效、不可变且驻留内存。
+**以下均为机制节选，未编译、未加载、未运行。** 本机没有可用 WDK，本次只做文档生成与官方 API 核对。代码使用真实 C 类型和 API，但省略 `DriverEntry`、INF、控制接口、日志持久化及重复测试装配，不能直接拼成可部署驱动。各入口由驱动初始化或管理路径串行调用；成功注册后保持状态有效，注销成功后才释放依赖。代码中的固定对象和规则仅用于自有实验目标。
 
 # 项目结构
 
-以下是示意职责划分，片段分别放入对应文件；没有在本机创建或安装这些驱动模块。
+下面按职责组织学习代码；模块边界不要求对应独立 `.sys`。实际集成可将 Minifilter 与其他模块放在同一驱动，也可分别部署。
 
 ```text
 EdrLab/
 ├─ driver/
-│  ├─ entry.c        # 模块初始化、失败回滚与统一退出
-│  ├─ process.c      # Ps 创建裁决
-│  ├─ object.c       # Ob 句柄授权
+│  ├─ entry.c        # 生命周期协调、部分失败回滚
+│  ├─ process.c      # Ps 通知
+│  ├─ object.c       # Ob 句柄过滤
 │  ├─ registry.c     # Cm 注册表过滤
 │  ├─ file.c         # Minifilter
-│  ├─ network.c      # WFP 运行时
-│  └─ EdrLab.inf     # 签名安装与文件过滤实例配置
-├─ service/
-│  ├─ main.c         # 配置、事件消费与持久化
-│  └─ wfp_policy.c   # WFP 管理对象
-└─ shared/
-   └─ protocol.h     # 双方约定的消息、GUID 与策略值
+│  ├─ network.c      # WFP 运行时 Callout
+│  ├─ events.c       # 有界队列、数据所有权与消费
+│  └─ EdrLab.inf     # 服务与过滤实例安装配置
+├─ shared/protocol.h # 受限控制协议、事件与共享 GUID
+└─ service/
+   ├─ main.c         # 策略发布、事件消费
+   └─ wfp_policy.c   # WFP 管理对象
 ```
 
 # 进程、线程与镜像通知
 
-三类通知分别描述进程生命周期、线程生命周期和镜像映射。以下以进程 Ex 通知展示裁决链；线程与镜像的观测差异随后比较。
+Ps 通知分别描述进程创建/退出、线程创建/退出和镜像映射。下面把参数解释、处理、注册与注销放在同一条机制链中。
 
-## 进程创建裁决
+## 进程创建与退出
 
-调用方传入与通知使用相同名称空间的完整映像路径；例子只拒绝该路径，名称不可用时放行。
+机制节选使用 `PsSetCreateProcessNotifyRoutineEx`。入口 `DeniedImage` 由初始化方提供，是与通知名称空间一致的完整实验镜像名称；其字符串存储须保持只读、常驻，直至注销成功。示例采用精确名称匹配，名称不可用时放行。
 
 ```c
 #include <ntddk.h>
@@ -68,113 +87,172 @@ EdrLab/
 static UNICODE_STRING gDeniedImage;
 static BOOLEAN gProcessRegistered;
 
-static VOID ProcessNotify(
-    PEPROCESS Process, HANDLE ProcessId, PPS_CREATE_NOTIFY_INFO Info)
+static VOID OnProcess(PEPROCESS Process, HANDLE ProcessId,
+                      PPS_CREATE_NOTIFY_INFO Info)
 {
-    UNREFERENCED_PARAMETER(Process);   // 正在创建或退出的目标对象
-    UNREFERENCED_PARAMETER(ProcessId); // 目标 PID，不是创建者 PID
-    if (Info == NULL)
-        return;                      // 退出通知：没有创建信息可读取
+    UNREFERENCED_PARAMETER(Process);
+    UNREFERENCED_PARAMETER(ProcessId);
+    if (Info == NULL) {
+        // Process / ProcessId 是退出的目标进程；这里没有创建信息。
+        // ...：省略退出事件的序列化和上报。
+        return;
+    }
 
-    // ParentProcessId 是父进程；CreatingThreadId 是实际创建者。
-    // CommandLine、ImageFileName 均可能为空，不能直接保留借用指针。
-    if (NT_SUCCESS(Info->CreationStatus) && // 保留其他组件已有的失败
-        Info->FileOpenNameAvailable &&
+    // ParentProcessId 是父进程；CreatingThreadId 是实际创建者进程/线程。
+    // FileObject 对应可执行文件；ImageFileName、CommandLine 都要处理缺失。
+    // FileOpenNameAvailable 为真才以准确的打开名称执行这条实验策略。
+    if (NT_SUCCESS(Info->CreationStatus) && Info->FileOpenNameAvailable &&
         Info->ImageFileName != NULL &&
         RtlEqualUnicodeString(Info->ImageFileName, &gDeniedImage, TRUE)) {
         Info->CreationStatus = STATUS_ACCESS_DENIED;
     }
-    // 回调返回 VOID；否决通过 CreationStatus 生效。
+    // 回调返回 VOID：阻断写在 CreationStatus，不是函数返回值。
+    // ...：省略采集字段的深拷贝、日志格式化和事件队列；不外借 Info 指针。
 }
 
-NTSTATUS StartProcessNotify(PCUNICODE_STRING ExactImagePath)
+NTSTATUS StartProcess(PCUNICODE_STRING DeniedImage)
 {
-    NTSTATUS status;
-    gDeniedImage = *ExactImagePath; // 借用配置缓冲区，须活到成功注销之后
-    status = PsSetCreateProcessNotifyRoutineEx(ProcessNotify, FALSE);
+    if (gProcessRegistered) return STATUS_INVALID_DEVICE_STATE;
+    if (DeniedImage == NULL || DeniedImage->Buffer == NULL ||
+        DeniedImage->Length == 0) return STATUS_INVALID_PARAMETER;
+    gDeniedImage = *DeniedImage;  // 借用入口约定的只读、常驻字符串。
+    NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(OnProcess, FALSE);
     gProcessRegistered = NT_SUCCESS(status);
-    return status;                 // 含签名/完整性、重复注册、容量等失败
+    if (!gProcessRegistered) RtlZeroMemory(&gDeniedImage, sizeof(gDeniedImage));
+    return status;
 }
 
-NTSTATUS StopProcessNotify(VOID)
+NTSTATUS StopProcess(VOID)
 {
-    NTSTATUS status;
-    if (!gProcessRegistered)
-        return STATUS_SUCCESS;
-    // 必须从自身回调之外调用；返回前等待在途回调结束。
-    status = PsSetCreateProcessNotifyRoutineEx(ProcessNotify, TRUE);
-    if (NT_SUCCESS(status))
+    if (!gProcessRegistered) return STATUS_SUCCESS;
+    // 不能在 OnProcess 内调用；成功返回前等待在途回调结束。
+    NTSTATUS status = PsSetCreateProcessNotifyRoutineEx(OnProcess, TRUE);
+    if (NT_SUCCESS(status)) {
         gProcessRegistered = FALSE;
-    return status;                 // 失败时保留配置和代码，不能继续卸载
+        RtlZeroMemory(&gDeniedImage, sizeof(gDeniedImage));
+    }
+    return status;  // 失败时调用者必须保留代码和策略存储。
 }
 ```
 
-Ex 注册要求映像具有 `IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY`；`/INTEGRITYCHECK` 与此相关，系统签名要求仍需满足。传统进程通知没有创建状态字段；Ex2 可扩展至子系统进程，其文件对象、名称和命令行可能为空。[注册与注销](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex)、[创建信息](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_ps_create_notify_info)
+`CreationStatus` 仍可能被后续检查影响；本回调放行只表示未在此处拒绝。Ex 注册要求回调映像具备 `IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY`，对应链接选项 `/INTEGRITYCHECK`，并须满足驱动签名要求。[Ex 注册契约](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex)、[创建信息字段](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_ps_create_notify_info)。
+
+| 进程通知接口 | 差异 |
+| --- | --- |
+| `PsSetCreateProcessNotifyRoutine` | 传统通知参数没有 `CreationStatus`。 |
+| `PsSetCreateProcessNotifyRoutineEx` | Vista SP1 / Server 2008 起提供创建信息与否决能力。 |
+| `PsSetCreateProcessNotifyRoutineEx2` | Windows 10 1703 起可通过通知类型覆盖子系统进程；对应名称、文件对象、命令行可能缺失。 |
+
+Ex2 注销应沿用原通知类型与回调，并设置 `Remove = TRUE`。[传统接口](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutine)、[Ex2](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex2)。
 
 ## 线程与镜像观测
 
-| 通知 | 参数与时机 | 生命周期与覆盖 |
-|---|---|---|
-| `PsSetCreateThreadNotifyRoutine` | `ProcessId`、`ThreadId`、`Create`；创建为真，删除为假；返回 `VOID`。 | `PsRemoveCreateThreadNotifyRoutine` 注销；参数本身不提供创建否决或恶意性判断。 |
-| `PsSetLoadImageNotifyRoutine` | 映像映射后、入口点执行前；`ImageBase`、`ImageSize` 位于 `IMAGE_INFO`；名称可能为空，驱动映像的 PID 为零。 | `PsRemoveLoadImageNotifyRoutine` 注销；返回 `VOID`，没有失败返回式阻断，也没有对应的通用卸载通知。 |
+这一机制节选用原子计数展示通知到达后的实际处理，事件详情输出作为非核心部分省略。两个 `Set*` 入口各管理自己的注册状态；成功启用一次，再成功停用一次，才能卸载代码。
 
-线程 Ex 的通知模式会影响回调线程上下文；镜像 Ex 的标志可扩展跨体系结构覆盖。镜像事件不覆盖全部可执行内存修改，`SEC_IMAGE_NO_EXECUTE` 映射也不触发普通加载通知。[线程回调](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pcreate_thread_notify_routine)、[镜像回调](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pload_image_notify_routine)
+```c
+// 使用上一节的 ntddk.h；全局状态在任何注册前已经零初始化。
+static volatile LONG gThreadCreates, gThreadExits, gUserImages, gKernelImages;
+static BOOLEAN gThreadRegistered, gImageRegistered;
+
+static VOID OnThread(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
+{
+    // ProcessId / ThreadId 标识发生生命周期变化的线程及所属进程。
+    UNREFERENCED_PARAMETER(ProcessId);
+    UNREFERENCED_PARAMETER(ThreadId);
+    if (Create) InterlockedIncrement(&gThreadCreates);
+    else InterlockedIncrement(&gThreadExits);
+    // ...：省略线程事件输出；此接口没有拒绝创建的状态字段。
+}
+
+static VOID OnImage(PUNICODE_STRING FullImageName, HANDLE ProcessId,
+                    PIMAGE_INFO ImageInfo)
+{
+    UNREFERENCED_PARAMETER(FullImageName); // 名称可能为 NULL。
+    UNREFERENCED_PARAMETER(ProcessId);     // 驱动镜像加载时为 0。
+    if (ImageInfo->SystemModeImage) InterlockedIncrement(&gKernelImages);
+    else InterlockedIncrement(&gUserImages);
+    // ImageBase / ImageSize 描述映射范围；回调发生在映射后、入口调用前。
+    // ...：省略名称和映射字段的复制、事件输出。
+}
+
+NTSTATUS SetThreadMonitor(BOOLEAN Enable)
+{
+    if (Enable == gThreadRegistered) return STATUS_SUCCESS;
+    NTSTATUS status = Enable ? PsSetCreateThreadNotifyRoutine(OnThread)
+                             : PsRemoveCreateThreadNotifyRoutine(OnThread);
+    if (NT_SUCCESS(status)) gThreadRegistered = Enable;
+    return status;
+}
+
+NTSTATUS SetImageMonitor(BOOLEAN Enable)
+{
+    if (Enable == gImageRegistered) return STATUS_SUCCESS;
+    NTSTATUS status = Enable ? PsSetLoadImageNotifyRoutine(OnImage)
+                             : PsRemoveLoadImageNotifyRoutine(OnImage);
+    if (NT_SUCCESS(status)) gImageRegistered = Enable;
+    return status;
+}
+```
+
+普通线程创建通知在创建者线程上下文执行；Windows 10 起的 `PsSetCreateThreadNotifyRoutineEx` 在 `PsCreateThreadNotifyNonSystem` 模式下改为新线程上下文。镜像 Ex 接口从 Windows 10 1709 起可扩展不同体系结构镜像的覆盖。它们的回调仍返回 `VOID`。[线程回调](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pcreate_thread_notify_routine)、[线程 Ex](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreatethreadnotifyroutineex)、[镜像回调](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pload_image_notify_routine)、[镜像 Ex](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetloadimagenotifyroutineex)。
+
+镜像通知针对镜像映射，无法据此覆盖所有可执行内存行为；这组 API 也没有对应的通用镜像卸载通知。`PsRemoveLoadImageNotifyRoutine` 撤销本驱动的通知注册，不改变目标镜像的加载状态。
 
 # 对象句柄过滤
 
-Ob 回调支持进程 `PsProcessType`、线程 `PsThreadType`，以及 Windows 10 起的桌面 `ExDesktopObjectType`。它参与句柄创建与复制；文件、令牌和注册表键使用各自接口。
+Ob 支持进程、线程句柄操作，Windows 10 起还支持桌面对象；支持列表不包含任意文件、令牌或注册表键对象。以下只保护一个已存在实验进程的新用户句柄，演示创建与复制两条参数分支。[Ob 注册](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-obregistercallbacks)。
 
-## 进程句柄授权
+## 权限裁剪与注册绑定
 
-下面只裁剪指定进程的用户句柄。调用方提供有效的目标进程对象和合法 Altitude；`OB_STATE` 放在调用方持有的驻留存储中，Stop 完成前不能释放。
+入口 `TargetPid` 来自已确认的 `LabTarget.exe` 实验实例，`Altitude` 来自该驱动的合法排序配置。模块自行取得并持有对象引用；使用对象指针匹配可避免将后续复用相同 PID 的另一实例纳入策略。所有启动、停止调用串行执行。
 
 ```c
 #include <ntifs.h>
 
-typedef struct {
-    PEPROCESS Target;
+typedef struct _OB_LAB {
+    PEPROCESS Target;         // 本模块持有引用，注销后再释放。
     PVOID Registration;
-    volatile LONG LastGrantedAccess; // 最近一次成功完成的目标句柄权限
-} OB_STATE;
+    volatile LONG SuccessfulHandles;
+} OB_LAB;
+static OB_LAB gOb;
 
-static OB_PREOP_CALLBACK_STATUS ObjectPre(
-    PVOID Context, POB_PRE_OPERATION_INFORMATION Info)
+static OB_PREOP_CALLBACK_STATUS OnObPre(
+    PVOID RegistrationContext, POB_PRE_OPERATION_INFORMATION Info)
 {
-    OB_STATE *s = Context;
+    OB_LAB *ctx = (OB_LAB *)RegistrationContext;
+    if (Info->ObjectType != *PsProcessType || Info->Object != ctx->Target ||
+        Info->KernelHandle) { // 实验范围跳过内核句柄，不据此判定调用者可信。
+        return OB_PREOP_SUCCESS;
+    }
+
     ACCESS_MASK *desired;
-
-    if (Info->ObjectType != *PsProcessType ||
-        Info->Object != s->Target || Info->KernelHandle)
-        return OB_PREOP_SUCCESS;    // 此例不限制内核句柄
-
     switch (Info->Operation) {
     case OB_OPERATION_HANDLE_CREATE:
         desired = &Info->Parameters->CreateHandleInformation.DesiredAccess;
         break;
     case OB_OPERATION_HANDLE_DUPLICATE:
         desired = &Info->Parameters->DuplicateHandleInformation.DesiredAccess;
-        // SourceProcess/TargetProcess 是两个句柄表所属进程；
-        // 真正被访问的进程仍是 Info->Object。
+        // SourceProcess / TargetProcess 是源、接收方句柄表的所属进程。
+        // 被保护的进程仍由 Info->Object 标识。
         break;
     default:
         return OB_PREOP_SUCCESS;
     }
 
-    // OriginalDesiredAccess 保留原始请求，DesiredAccess 是当前待授予权限。
-    // 只在当前值清除文档允许修改的位，保留其他过滤器已做的限制。
+    // OriginalDesiredAccess 保留最初请求；当前 DesiredAccess 可已被其他过滤器削减。
+    // 只清除文档列出的可修改位，不从 OriginalDesiredAccess 重建权限。
     *desired &= ~(PROCESS_TERMINATE | PROCESS_CREATE_THREAD |
                   PROCESS_VM_OPERATION | PROCESS_VM_WRITE);
-    Info->CallContext = s;          // 只作本次已处理标记，不存可变每操作数据
-    return OB_PREOP_SUCCESS;        // 状态不用于否决；可能获得权限更少的句柄
+    return OB_PREOP_SUCCESS;  // Ob Pre 的规定返回值；不是 NTSTATUS 拒绝接口。
 }
 
-static VOID ObjectPost(PVOID Context, POB_POST_OPERATION_INFORMATION Info)
+static VOID OnObPost(PVOID RegistrationContext, POB_POST_OPERATION_INFORMATION Info)
 {
-    OB_STATE *s = Context;
-    ACCESS_MASK granted;
-    if (Info->CallContext != s || !NT_SUCCESS(Info->ReturnStatus))
-        return;                    // 失败时 Parameters 不保证有效
+    OB_LAB *ctx = (OB_LAB *)RegistrationContext;
+    if (Info->Object != ctx->Target || Info->KernelHandle ||
+        !NT_SUCCESS(Info->ReturnStatus)) return;
 
+    ACCESS_MASK granted;
     switch (Info->Operation) {
     case OB_OPERATION_HANDLE_CREATE:
         granted = Info->Parameters->CreateHandleInformation.GrantedAccess;
@@ -185,105 +263,84 @@ static VOID ObjectPost(PVOID Context, POB_POST_OPERATION_INFORMATION Info)
     default:
         return;
     }
-    InterlockedExchange(&s->LastGrantedAccess, (LONG)granted);
-    // Post 只读结果；不会在这里重新修改授权。
+    InterlockedIncrement(&ctx->SuccessfulHandles);
+    UNREFERENCED_PARAMETER(granted);
+    // ...：省略 granted 的审计输出；Post 结构只读，不能在此继续裁剪。
 }
 
-NTSTATUS StartObjectFilter(
-    OB_STATE *s, PEPROCESS Target, PCUNICODE_STRING Altitude)
+NTSTATUS StartOb(HANDLE TargetPid, PCUNICODE_STRING Altitude)
 {
-    struct {
-        OB_CALLBACK_REGISTRATION Registration;
-        OB_OPERATION_REGISTRATION Operation;
-    } r = {0};
-    NTSTATUS status;
-    RtlZeroMemory(s, sizeof(*s));
-    ObReferenceObject(Target);       // 调用方已有有效引用；本模块再持有一份
-    s->Target = Target;
+    if (gOb.Registration != NULL) return STATUS_INVALID_DEVICE_STATE;
+    NTSTATUS status = PsLookupProcessByProcessId(TargetPid, &gOb.Target);
+    if (!NT_SUCCESS(status)) return status;
 
-    r.Operation.ObjectType = PsProcessType; // 注册处为 POBJECT_TYPE*
-    r.Operation.Operations =
-        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
-    r.Operation.PreOperation = ObjectPre;
-    r.Operation.PostOperation = ObjectPost;
-    r.Registration.Version = OB_FLT_REGISTRATION_VERSION;
-    r.Registration.OperationRegistrationCount = 1;
-    r.Registration.Altitude = *Altitude;    // 不内置可供生产使用的高度
-    r.Registration.RegistrationContext = s;
-    r.Registration.OperationRegistration = &r.Operation;
-
-    status = ObRegisterCallbacks(&r.Registration, &s->Registration);
+    struct { OB_CALLBACK_REGISTRATION Reg; OB_OPERATION_REGISTRATION Op; } r = {0};
+    r.Op.ObjectType = PsProcessType;  // 注册字段是对象类型指针的地址。
+    r.Op.Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    r.Op.PreOperation = OnObPre;
+    r.Op.PostOperation = OnObPost;
+    r.Reg.Version = OB_FLT_REGISTRATION_VERSION;
+    r.Reg.OperationRegistrationCount = 1;
+    r.Reg.Altitude = *Altitude;
+    r.Reg.RegistrationContext = &gOb; // 系统原样交给两个回调。
+    r.Reg.OperationRegistration = &r.Op;
+    status = ObRegisterCallbacks(&r.Reg, &gOb.Registration);
     if (!NT_SUCCESS(status)) {
-        s->Registration = NULL;
-        ObDereferenceObject(s->Target);
-        s->Target = NULL;
+        gOb.Registration = NULL;
+        ObDereferenceObject(gOb.Target);
+        gOb.Target = NULL;
     }
     return status;
 }
 
-VOID StopObjectFilter(OB_STATE *s)
+VOID StopOb(VOID)
 {
-    if (s->Registration == NULL)
-        return;
-    ObUnRegisterCallbacks(s->Registration);
-    s->Registration = NULL;
-    ObDereferenceObject(s->Target);   // 先注销，再释放回调引用的对象
-    s->Target = NULL;
+    if (gOb.Registration == NULL) return;
+    ObUnRegisterCallbacks(gOb.Registration);
+    gOb.Registration = NULL;
+    ObDereferenceObject(gOb.Target);
+    gOb.Target = NULL;
 }
 ```
 
-可修改权限以结构文档的清单为准，其中不包含 `PROCESS_VM_READ`。注册高度冲突和未签名内核映像均可使注册失败。[权限约束](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_pre_create_handle_information)、[注册结构](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_callback_registration)、[注册失败](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-obregistercallbacks)、[Post 结果](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_post_operation_information)
+注册结构的 `ObjectType` 与回调参数的字段具有不同指针层级；上面的 `PsProcessType` / `*PsProcessType` 用法按各自类型匹配。回调映像必须满足签名要求，重复高度可导致注册失败。[注册结构](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_callback_registration)、[Pre 契约](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-pob_pre_operation_callback)、[Post 契约](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-pob_post_operation_callback)。
 
-新建一个指向既有进程的句柄不会重新创建进程；已有句柄上的授权也不会被新注册的 Ob 策略追溯撤销。线程句柄需要独立注册 `PsThreadType` 并使用线程权限集合；这个进程示例只覆盖新进程句柄授权。
+权限位存在于 `ACCESS_MASK` 并不表示可由 Ob 任意修改；例如官方可修改进程权限列表未列出 `PROCESS_VM_READ`。裁剪后申请方仍可能获得有效句柄，后续依赖被移除权限的操作才失败。已有句柄不因新注册或策略更新而被追溯重新授权。[可修改权限](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_pre_create_handle_information)、[复制参数](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_ob_pre_duplicate_handle_information)。
 
 # 注册表过滤
 
-Configuration Manager 用一个回调入口分派注册表通知；`Argument1` 决定 `Argument2` 的结构类型。以下示例按完整内核键名，拒绝设置值、删除值、删除键和重命名键；名称查询失败时放行。
+Cm 是注册表 Configuration Manager 的接口，独立于文件系统过滤。以下机制节选拒绝对测试键本身设置值、删除值、删除键与重命名；创建/打开、子键及其他注册表操作不在这条实验策略中。
 
-## 键操作分派
+## 通知分派、名称与拒绝
 
-调用方提供合法 Altitude 和驻留的 `CM_STATE`。此例固定保护 `\REGISTRY\MACHINE\SOFTWARE\EdrLab`，对应 `HKLM\SOFTWARE\EdrLab`，不递归匹配子键。
+`DriverObject` 由驱动入口传入，`Altitude` 来自该模块的排序配置。内核键名使用 `\REGISTRY\MACHINE\...` 名称空间；`HKLM\...` 是另一种表示，不能直接进行字符串比较。示例选择名称查询失败时放行并计数。
 
 ```c
-#include <ntifs.h>
+#include <ntddk.h>
 
-typedef struct {
+typedef struct _CM_LAB {
     LARGE_INTEGER Cookie;
-    volatile LONG Ready;           // 注册成功后才允许读取 Cookie
-    volatile LONG Completed;
     BOOLEAN Registered;
-} CM_STATE;
+    volatile LONG Ready;
+    volatile LONG NameFailures, Denied, Completed, Failed;
+} CM_LAB;
+static CM_LAB gCm;
+static const UNICODE_STRING gProtectedKey =
+    RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SOFTWARE\\EdrLab");
 
-static BOOLEAN IsProtectedKey(CM_STATE *s, PVOID Object)
+static NTSTATUS OnRegistry(PVOID CallbackContext, PVOID Argument1, PVOID Argument2)
 {
-    const UNICODE_STRING protectedName =
-        RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SOFTWARE\\EdrLab");
-    PCUNICODE_STRING name;
-    BOOLEAN match;
-    NTSTATUS status = CmCallbackGetKeyObjectIDEx(
-        &s->Cookie, Object, NULL, &name, 0);
-    if (!NT_SUCCESS(status))
-        return FALSE;              // 此例明确采用查询失败放行
-
-    match = RtlEqualUnicodeString(name, &protectedName, TRUE);
-    CmCallbackReleaseKeyObjectIDEx(name); // 名称所有权在本次回调内闭合
-    return match;
-}
-
-static NTSTATUS RegistryNotify(PVOID Context, PVOID Argument1, PVOID Argument2)
-{
-    CM_STATE *s = Context;          // 来自 CmRegisterCallbackEx 的 Context
-    PVOID object;
+    CM_LAB *ctx = (CM_LAB *)CallbackContext;
+    // 注册返回前可能收到通知；Cookie 尚未发布时明确放行。
+    if (InterlockedCompareExchange(&ctx->Ready, 0, 0) == 0) return STATUS_SUCCESS;
     REG_NOTIFY_CLASS kind = (REG_NOTIFY_CLASS)(ULONG_PTR)Argument1;
-
-    if (InterlockedCompareExchange(&s->Ready, 0, 0) == 0)
-        return STATUS_SUCCESS;     // 初始化窗口放行；不读取未发布的 Cookie
-
+    PVOID object;
+    PCUNICODE_STRING name = NULL;
+    // Argument1 承载枚举值；Argument2 才是按该类别解释的信息结构。
     switch (kind) {
     case RegNtPreSetValueKey:
         object = ((PREG_SET_VALUE_KEY_INFORMATION)Argument2)->Object;
-        // ValueName、Type、Data、DataSize 描述待写值；本策略只判断键。
-        break;
+        break; // ValueName / Data 等是该次设置值操作的其他输入。
     case RegNtPreDeleteValueKey:
         object = ((PREG_DELETE_VALUE_KEY_INFORMATION)Argument2)->Object;
         break;
@@ -292,430 +349,441 @@ static NTSTATUS RegistryNotify(PVOID Context, PVOID Argument1, PVOID Argument2)
         break;
     case RegNtPreRenameKey:
         object = ((PREG_RENAME_KEY_INFORMATION)Argument2)->Object;
-        break;
+        break; // 按重命名前的目标键匹配。
+    case RegNtPreCreateKeyEx:
+        // Argument2 -> REG_CREATE_KEY_INFORMATION / 对应 V1；此策略允许创建。
+        return STATUS_SUCCESS;
+    case RegNtPreOpenKeyEx:
+        // Argument2 -> REG_OPEN_KEY_INFORMATION / 对应 V1；此策略允许打开。
+        return STATUS_SUCCESS;
+    case RegNtPostCreateKeyEx:
+    case RegNtPostOpenKeyEx: {
+        PREG_POST_OPERATION_INFORMATION post = (PREG_POST_OPERATION_INFORMATION)Argument2;
+        if (post->Status != STATUS_SUCCESS) {
+            // 包括某些 NT_SUCCESS 为真的非零值；此时禁止使用 post->Object。
+            if (!NT_SUCCESS(post->Status)) InterlockedIncrement(&ctx->Failed);
+            return STATUS_SUCCESS;
+        }
+        InterlockedIncrement(&ctx->Completed);
+        // ...：省略成功创建/打开的事件输出；对象仅在这个成功分支中有效。
+        return STATUS_SUCCESS;
+    }
     case RegNtPostSetValueKey:
     case RegNtPostDeleteValueKey:
     case RegNtPostDeleteKey:
     case RegNtPostRenameKey: {
-        PREG_POST_OPERATION_INFORMATION post = Argument2;
-        if (NT_SUCCESS(post->Status))
-            InterlockedIncrement(&s->Completed); // 只统计已完成操作
-        return STATUS_SUCCESS;     // 保留系统结果，不解引用 Post 的 Object
+        PREG_POST_OPERATION_INFORMATION post = (PREG_POST_OPERATION_INFORMATION)Argument2;
+        if (NT_SUCCESS(post->Status)) InterlockedIncrement(&ctx->Completed);
+        else InterlockedIncrement(&ctx->Failed);
+        return STATUS_SUCCESS; // 本例只观察完成结果，不改 ReturnStatus。
     }
     default:
-        return STATUS_SUCCESS;     // 其他类型不参与，不能套用上述结构
+        return STATUS_SUCCESS;
     }
 
-    if (!IsProtectedKey(s, object))
-        return STATUS_SUCCESS;
-    return STATUS_ACCESS_DENIED;    // 不执行原操作；自己拒绝后没有对应 Post
+    NTSTATUS status = CmCallbackGetKeyObjectIDEx(&ctx->Cookie, object, NULL, &name, 0);
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement(&ctx->NameFailures);
+        return STATUS_SUCCESS; // 明确的 fail-open，不将查询失败当作名称不匹配。
+    }
+    BOOLEAN deny = RtlEqualUnicodeString(name, &gProtectedKey, TRUE);
+    CmCallbackReleaseKeyObjectIDEx(name); // 名称由 Cm 管理，配对释放。
+    if (deny) InterlockedIncrement(&ctx->Denied); // 拒绝必须在 Pre 记录。
+    return deny ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
 }
 
-NTSTATUS StartRegistryFilter(
-    CM_STATE *s, PDRIVER_OBJECT Driver, PCUNICODE_STRING Altitude)
+NTSTATUS StartRegistry(PDRIVER_OBJECT DriverObject, PCUNICODE_STRING Altitude)
 {
-    NTSTATUS status;
-    RtlZeroMemory(s, sizeof(*s));
-    status = CmRegisterCallbackEx(
-        RegistryNotify, Altitude, Driver, s, &s->Cookie, NULL);
-    if (NT_SUCCESS(status)) {
-        s->Registered = TRUE;
-        InterlockedExchange(&s->Ready, 1); // 发布成功返回的 Cookie
-    }
+    if (gCm.Registered) return STATUS_INVALID_DEVICE_STATE;
+    NTSTATUS status = CmRegisterCallbackEx(OnRegistry, Altitude, DriverObject,
+                                           &gCm, &gCm.Cookie, NULL);
+    gCm.Registered = NT_SUCCESS(status);
+    if (gCm.Registered) InterlockedExchange(&gCm.Ready, 1); // 发布有效 Cookie。
     return status;
 }
 
-NTSTATUS StopRegistryFilter(CM_STATE *s)
+NTSTATUS StopRegistry(VOID)
 {
-    NTSTATUS status;
-    if (!s->Registered)
-        return STATUS_SUCCESS;
-    // 在回调之外注销；保持 s 有效，直到注销成功。
-    status = CmUnRegisterCallback(s->Cookie);
+    if (!gCm.Registered) return STATUS_SUCCESS;
+    // 从管理路径注销；在 OnRegistry 内调用会造成死锁风险。
+    NTSTATUS status = CmUnRegisterCallback(gCm.Cookie);
     if (NT_SUCCESS(status)) {
-        s->Registered = FALSE;
-        InterlockedExchange(&s->Ready, 0);
+        gCm.Registered = FALSE;
+        InterlockedExchange(&gCm.Ready, 0);
     }
     return status;
 }
 ```
 
-注册、枚举对应的参数类型及名称释放依据：[CmRegisterCallbackEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-cmregistercallbackex)、[RegistryCallback](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-ex_callback_function)、[键名称查询](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-cmcallbackgetkeyobjectidex)。Ex 名称接口要求 Windows 8 起的系统。
+通知类型与参数结构对应关系见[RegistryCallback](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-ex_callback_function)；注册与名称获取分别见[CmRegisterCallbackEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-cmregistercallbackex)、[CmCallbackGetKeyObjectIDEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-cmcallbackgetkeyobjectidex)。Ex 名称接口从 Windows 8 起可用，获取的名称需要配对释放。
 
-## 输出接管与对象有效期
+本回调在 Pre 返回失败后，不会收到该操作对应的 Post。`STATUS_CALLBACK_BYPASS` 用于按契约接管操作，或配合 Post 的 `ReturnStatus` 改写结果；使用者必须同时处理输出、已创建对象及资源所有权。本例不采用该路径。[通知处理规则](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/handling-notifications)。
 
-Pre 返回 `STATUS_CALLBACK_BYPASS` 表示已经接管并完成操作，须提供有效输出，也没有对应 Post。Post 改变调用方所见状态时，应设置 `ReturnStatus` 并返回 `STATUS_CALLBACK_BYPASS`；成功改失败需处理已生成资源，失败改成功需补齐有效输出。仅观察结果时返回 `STATUS_SUCCESS`。[通知处理契约](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/handling-notifications)
-
-`RegNtPostCreateKeyEx`、`RegNtPostOpenKeyEx` 仅在 `Status == STATUS_SUCCESS` 时拥有有效 `Object`，单用 `NT_SUCCESS` 不够。关闭、对象上下文清理通知可能携带正在销毁的对象，不能仅凭非空就增加引用。[无效键对象指针](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/invalid-key-object-pointers-in-registry-notifications)
-
-`CallContext` 跟随一次操作，`CmSetCallbackObjectContext` 关联键对象并产生对象上下文清理通知。嵌套数据须按对应通知的访问规则读取；跨回调保存需复制或合法持有，回调内再次调用注册表 API 还需处理重入。上述例子未读取值数据、分配操作上下文或发起嵌套注册表操作。
+`CallContext` 关联一次操作的前后处理，`CmSetCallbackObjectContext` 关联键对象生命周期。后者需要处理清理通知。关闭与上下文清理通知中的键对象可能已经处于引用计数为零的销毁阶段，不能把非空 `Object` 普遍交给 `ObReferenceObjectByPointer`。嵌套缓冲区访问还须遵守通知结构及系统版本的捕获规则，异步任务不得直接保留借用指针。[无效键对象规则](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/invalid-key-object-pointers-in-registry-notifications)。
 
 # 文件系统过滤
 
-Minifilter 由 `FltMgr.sys` 管理。Filter 表示已注册驱动，Instance 表示附加到某个卷的实例，Altitude 决定实例在文件过滤栈中的相对位置；Pre 向下，Post 沿完成路径向上。
+Minifilter 由 FltMgr 管理。Filter 表示注册的过滤驱动，Instance 表示它在某个卷上的附加实例，Altitude 决定实例在过滤栈中的相对位置。Pre 通常从高向低流转，Post 反向返回；这个排序仅属于文件过滤栈。注册成功后仍需确认目标卷实例已附加。[实例与高度](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/load-order-groups-and-altitudes-for-minifilter-drivers)。
 
-## 文件过滤接入
+## 文件打开过滤接入
 
-此例在 DriverEntry 初始化路径中调用 `StartFileFilter`，以完整规范化路径限制新建/打开请求。INF 必须已配置合法实例及 Altitude，目标卷必须附加实例。
+机制节选只处理 `IRP_MJ_CREATE`，它同时覆盖创建与打开。入口 `DeniedName` 由配置方提供，是目标卷上一个实验文件的规范化名称；存储须在过滤期间保持只读、常驻。INF 的实例配置由外部工程准备；本片段没有队列、通信端口或挂起 I/O。
 
 ```c
 #include <fltKernel.h>
 
 static PFLT_FILTER gFilter;
-static UNICODE_STRING gDeniedFile;
+static UNICODE_STRING gDeniedName;
+static volatile LONG gFileNameFailures;
 
-static FLT_PREOP_CALLBACK_STATUS FLTAPI PreCreate(
-    PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS Objects,
-    PVOID *CompletionContext)
+static FLT_PREOP_CALLBACK_STATUS OnPreCreate(PFLT_CALLBACK_DATA Data,
+    PCFLT_RELATED_OBJECTS Objects, PVOID *CompletionContext)
 {
-    PFLT_FILE_NAME_INFORMATION name;
-    BOOLEAN deny;
-    NTSTATUS status;
     UNREFERENCED_PARAMETER(Objects);
-    *CompletionContext = NULL;      // 本例既不挂起，也不申请 Post
-
-    status = FltGetFileNameInformation(
-        Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &name);
-    if (!NT_SUCCESS(status))
-        return FLT_PREOP_SUCCESS_NO_CALLBACK; // 名称查询失败时放行
-
-    deny = RtlEqualUnicodeString(&name->Name, &gDeniedFile, TRUE);
+    *CompletionContext = NULL;
+    PFLT_FILE_NAME_INFORMATION name = NULL;
+    NTSTATUS status = FltGetFileNameInformation(Data,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &name);
+    if (!NT_SUCCESS(status)) {
+        InterlockedIncrement(&gFileNameFailures);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK; // 示例名称查询失败时放行。
+    }
+    BOOLEAN deny = RtlEqualUnicodeString(&name->Name, &gDeniedName, TRUE);
     FltReleaseFileNameInformation(name);
-    if (!deny)
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-
+    if (!deny) return FLT_PREOP_SUCCESS_NO_CALLBACK;
     Data->IoStatus.Status = STATUS_ACCESS_DENIED;
     Data->IoStatus.Information = 0;
-    return FLT_PREOP_COMPLETE;      // 不下发；本过滤器也不会收到 Post
-    // 只改 IoStatus 不必调用 FltSetCallbackDataDirty。
+    return FLT_PREOP_COMPLETE; // 不继续下发，也不调用本过滤器的 Post。
 }
 
-VOID StopFileFilter(VOID)
-{
-    if (gFilter != NULL) {
-        FltUnregisterFilter(gFilter);
-        gFilter = NULL;
-    }
-}
-
-static NTSTATUS FLTAPI FileUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
+static NTSTATUS OnFilterUnload(FLT_FILTER_UNLOAD_FLAGS Flags)
 {
     UNREFERENCED_PARAMETER(Flags);
-    StopFileFilter();               // 此片段没有自有队列、端口或挂起请求
+    FltUnregisterFilter(gFilter);
+    gFilter = NULL;
+    RtlZeroMemory(&gDeniedName, sizeof(gDeniedName));
     return STATUS_SUCCESS;
 }
 
-static const FLT_OPERATION_REGISTRATION gFileOperations[] = {
-    { IRP_MJ_CREATE, 0, PreCreate, NULL, NULL },
-    { IRP_MJ_OPERATION_END, 0, NULL, NULL, NULL }
+static const FLT_OPERATION_REGISTRATION gOperations[] = {
+    { IRP_MJ_CREATE, 0, OnPreCreate, NULL },
+    { IRP_MJ_OPERATION_END }
 };
-static FLT_REGISTRATION gFileRegistration; // 保留描述存储到卸载
+static FLT_REGISTRATION gRegistration;
 
-NTSTATUS StartFileFilter(PDRIVER_OBJECT Driver, PCUNICODE_STRING NormalizedPath)
+NTSTATUS StartFileFilter(PDRIVER_OBJECT DriverObject, PCUNICODE_STRING DeniedName)
 {
-    NTSTATUS status;
-    gDeniedFile = *NormalizedPath;  // 所有回调依赖数据必须在启动前就绪
-    gFileRegistration.Size = sizeof(gFileRegistration);
-    gFileRegistration.Version = FLT_REGISTRATION_VERSION;
-    gFileRegistration.OperationRegistration = gFileOperations;
-    gFileRegistration.FilterUnloadCallback = FileUnload;
-
-    status = FltRegisterFilter(Driver, &gFileRegistration, &gFilter);
+    if (gFilter != NULL) return STATUS_INVALID_DEVICE_STATE;
+    if (DeniedName == NULL || DeniedName->Buffer == NULL || DeniedName->Length == 0)
+        return STATUS_INVALID_PARAMETER;
+    gDeniedName = *DeniedName;
+    RtlZeroMemory(&gRegistration, sizeof(gRegistration));
+    gRegistration.Size = sizeof(gRegistration);
+    gRegistration.Version = FLT_REGISTRATION_VERSION;
+    gRegistration.OperationRegistration = gOperations;
+    gRegistration.FilterUnloadCallback = OnFilterUnload;
+    NTSTATUS status = FltRegisterFilter(DriverObject, &gRegistration, &gFilter);
     if (!NT_SUCCESS(status)) {
         gFilter = NULL;
+        RtlZeroMemory(&gDeniedName, sizeof(gDeniedName));
         return status;
     }
-    status = FltStartFiltering(gFilter); // 返回前就可能执行回调
-    if (!NT_SUCCESS(status))
-        StopFileFilter();           // 注册成功、启动失败的回滚
+    // 策略和回调依赖必须已就绪：本调用返回前就可能开始接收回调。
+    status = FltStartFiltering(gFilter);
+    if (!NT_SUCCESS(status)) {
+        FltUnregisterFilter(gFilter);
+        gFilter = NULL;
+        RtlZeroMemory(&gDeniedName, sizeof(gDeniedName));
+    }
     return status;
+    // ...：省略 DriverEntry、INF 安装和服务控制装配。
 }
 ```
 
-完成状态必须是最终值，不能为 `STATUS_PENDING`；Cleanup/Close 不能失败。更高层过滤器仍可收到该请求的 Post。规范化名称查询受 I/O 路径和执行上下文限制，查询失败放行是本例覆盖选择。[Pre 返回契约](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_pre_operation_callback)、[名称查询](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltgetfilenameinformation)、[注册](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltregisterfilter)、[启动](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltstartfiltering)
+名称查询受当前 I/O、缓存和执行上下文限制；精确路径策略还不能覆盖硬链接、重命名后的对象、已打开句柄或所有映射写入。正式文件保护需按目标语义选择对象身份及操作集合。[名称查询约束](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltgetfilenameinformation)、[过滤注册结构](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/ns-fltkernel-_flt_registration)、[启动时序](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltstartfiltering)。
 
-## I/O 覆盖与完成责任
+## I/O 生命周期
 
-`IRP_MJ_CREATE` 控制新打开；读写需注册 `IRP_MJ_READ/WRITE`，重命名和删除处置涉及 `IRP_MJ_SET_INFORMATION`。已有句柄、映射、缓存、分页及路径别名需按保护对象单独设计；在 Post 改返回状态不会自动撤销文件系统副作用。
+| 需求 | 对应接口或返回语义 |
+| --- | --- |
+| 观察读写或文件信息变化 | 分别注册 `IRP_MJ_READ`、`IRP_MJ_WRITE`、`IRP_MJ_SET_INFORMATION` 等；只注册 Create 不覆盖这些操作。 |
+| 放行且无需结果 | `FLT_PREOP_SUCCESS_NO_CALLBACK`。 |
+| 放行并观察完成 | 注册 Post，Pre 返回 `FLT_PREOP_SUCCESS_WITH_CALLBACK`。 |
+| 当前过滤器完成操作 | 设置 `IoStatus` 后返回 `FLT_PREOP_COMPLETE`；已经过的高层过滤器仍可能收到 Post。 |
+| 延后处理受支持的 IRP | `FLT_PREOP_PENDING`，后续必须调用 `FltCompletePendedPreOperation` 恢复或完成。 |
+| 拒绝本次 Fast I/O 路径 | `FLT_PREOP_DISALLOW_FASTIO`，不等于拒绝整个文件操作。 |
+| Cleanup / Close | 必须完成清理，不能将此类操作设置为失败。 |
 
-需要 Post 时注册完成回调并返回 `FLT_PREOP_SUCCESS_WITH_CALLBACK`；`CompletionContext` 用于传递该次操作的数据。Post 收到 `FLTFL_POST_OPERATION_DRAINING` 时只清理完成上下文并按框架规则退出。[Post 契约](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_post_operation_callback)
-
-`FLT_PREOP_PENDING` 只用于支持的 IRP 路径，后续须调用 `FltCompletePendedPreOperation`。正常裁决、超时、取消和卸载必须争取同一个完成权，保证每个请求只完成一次；`FLT_PREOP_DISALLOW_FASTIO` 仅拒绝 Fast I/O 路径，后续可能改走 IRP。[挂起与完成](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nf-fltkernel-fltcompletependedpreoperation)
+挂起路径须为正常裁决、取消、超时、卸载建立唯一完成责任，避免重复完成或永久挂起。Post 收到 `FLTFL_POST_OPERATION_DRAINING` 时应只做相应上下文清理。Post 改写失败状态也不会自动撤销已产生的文件内容变化。[Pre 返回规则](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_pre_operation_callback)、[Post 与排空](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_post_operation_callback)、[Post 失败的副作用边界](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/failing-an-i-o-operation-in-a-postoperation-callback-routine)。
 
 # 网络过滤
 
-WFP 的 Layer 决定处理阶段与可用数据，Sublayer 参与规则排序，Filter 指定条件和动作，Callout 提供自定义处理。固定条件可直接使用阻断 Filter；下例增加 Callout，用于展示管理面与运行时的连接。
+WFP 按网络处理层组织策略。固定条件的允许或阻断可直接用 Filter；需要自定义内核处理时再注册 Callout。`Fwps*` 提供内核运行时接口，`Fwpm*` 管理过滤引擎对象，部分管理 API 同时有用户态与内核态版本。本文选用户态配置规则、内核执行 Callout。
+
+## 过滤对象与层选择
 
 ```mermaid
 flowchart LR
-    S["服务：Fwpm 管理会话"] --> F["Filter：层、应用条件、动作"]
-    F -->|"属于"| SL["Sublayer"]
-    F -->|"动作引用 calloutKey"| MC["管理面 Callout"]
-    MC -. "同一 GUID" .-> RC["驱动：Fwps 运行时 Callout"]
-    L["ALE 出站授权层"] -->|"规则匹配"| F
-    F -->|"匹配后调用"| RC
+    A[LabClient.exe 新 IPv4 出站授权] --> L[ALE_AUTH_CONNECT_V4]
+    F[Filter：应用条件与动作] -->|安装在| L
+    F -->|归属并参与仲裁| S[Sublayer]
+    F -->|动作引用 calloutKey| M[管理面 Callout]
+    M -->|相同 GUID 对应| K[运行时 Callout]
+    K --> C[classifyFn]
 ```
 
-## 运行时与应用规则
+Filter 引用 Callout；两者有独立的注册与退出路径。仅注册运行时 Callout 不会自动获得所有网络流量。[Callout 注册](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutregister0)。
 
-`network.c` 的入口由驱动传入已创建的设备对象和项目自己的 Callout GUID。`FWPS_CALLOUT0` 使用六参数分类函数；`Filter->context` 来自下一块管理代码的 `rawContext`，这里用数值 1 表示拒绝。
+| 层类别 | 主要语义 |
+| --- | --- |
+| `ALE_AUTH_CONNECT_V4/V6` | 出站连接授权等。 |
+| `ALE_AUTH_RECV_ACCEPT_V4/V6` | 入站接收或接受授权。 |
+| `ALE_FLOW_ESTABLISHED_V4/V6` | 流建立后的关联与跟踪。 |
+| `STREAM_V4/V6` | TCP 数据流处理。 |
+| `DATAGRAM_DATA_V4/V6` | 数据报处理。 |
+| Transport / IP Packet 层 | 传输层或 IP 包处理。 |
+
+字段、`layerData` 类型及元数据可用性取决于层。读取进程 ID 前须检查 `currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID`；执行回调的当前线程不提供通用的应用归因依据。[WFP 分类参数](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nc-fwpsk-fwps_callout_classify_fn0)。
+
+## 运行时 Callout
+
+机制节选采用版本 `0` 的六参数分类函数，只阻断引用它的实验规则。`DeviceObject` 是驱动已创建且保持有效的设备对象；`CalloutKey` 来自项目共享 GUID，由管理面使用同一个值。设备创建与受限控制接口作为入口前提，不在这里重复展开。
 
 ```c
 #include <ntddk.h>
 #include <fwpsk.h>
 
-static VOID NTAPI ConnectClassify(
-    const FWPS_INCOMING_VALUES0 *Values,
+static UINT32 gCalloutId;
+static BOOLEAN gCalloutRegistered;
+
+static VOID OnClassify(const FWPS_INCOMING_VALUES0 *Values,
     const FWPS_INCOMING_METADATA_VALUES0 *Meta, VOID *LayerData,
     const FWPS_FILTER0 *Filter, UINT64 FlowContext, FWPS_CLASSIFY_OUT0 *Out)
 {
     UNREFERENCED_PARAMETER(Values);
     UNREFERENCED_PARAMETER(Meta);
     UNREFERENCED_PARAMETER(LayerData);
-    UNREFERENCED_PARAMETER(FlowContext); // 本例不关联流上下文
-
-    if ((Out->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
-        return;                    // 本例不走无写权限时的 Permit veto 路径
-
-    if (Filter->context == 1) {
-        Out->actionType = FWP_ACTION_BLOCK;
-        Out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
-    } else {
-        Out->actionType = FWP_ACTION_CONTINUE; // 继续仲裁，不承诺最终放行
-    }
+    UNREFERENCED_PARAMETER(Filter);
+    UNREFERENCED_PARAMETER(FlowContext);
+    // 该最小策略保守地保留无写权限时的既有裁决，不实现否决其他 PERMIT 的路径。
+    if ((Out->rights & FWPS_RIGHT_ACTION_WRITE) == 0) return;
+    Out->actionType = FWP_ACTION_BLOCK;
+    Out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
 }
 
-static NTSTATUS NTAPI ConnectNotify(
-    FWPS_CALLOUT_NOTIFY_TYPE Type, const GUID *FilterKey,
-    FWPS_FILTER0 *Filter)
+static NTSTATUS OnCalloutNotify(FWPS_CALLOUT_NOTIFY_TYPE Type,
+    const GUID *FilterKey, FWPS_FILTER0 *Filter)
 {
     UNREFERENCED_PARAMETER(Type);
     UNREFERENCED_PARAMETER(FilterKey);
     UNREFERENCED_PARAMETER(Filter);
-    return STATUS_SUCCESS;         // 添加/删除规则无需额外私有资源
+    // 本例不分配每规则资源，允许管理引擎添加引用本 Callout 的实验 Filter。
+    return STATUS_SUCCESS;
 }
 
-NTSTATUS StartConnectCallout(
-    PDEVICE_OBJECT Device, const GUID *Key, UINT32 *RuntimeId)
+NTSTATUS StartNetwork(PDEVICE_OBJECT DeviceObject, const GUID *CalloutKey)
 {
+    if (gCalloutRegistered) return STATUS_INVALID_DEVICE_STATE;
     FWPS_CALLOUT0 callout = {0};
-    callout.calloutKey = *Key;
-    callout.classifyFn = ConnectClassify;
-    callout.notifyFn = ConnectNotify;
-    // flowDeleteFn 为 NULL：没有 FwpsFlowAssociateContext0 创建的上下文。
-    return FwpsCalloutRegister0(Device, &callout, RuntimeId);
+    callout.calloutKey = *CalloutKey;
+    callout.classifyFn = OnClassify;
+    callout.notifyFn = OnCalloutNotify;
+    callout.flowDeleteFn = NULL; // 未关联自定义 flow context。
+    NTSTATUS status = FwpsCalloutRegister0(DeviceObject, &callout, &gCalloutId);
+    gCalloutRegistered = NT_SUCCESS(status);
+    return status;
 }
 
-NTSTATUS StopConnectCallout(UINT32 RuntimeId)
+NTSTATUS StopNetwork(VOID)
 {
-    // 仅在成功注册后调用；管理面先撤销引用此 Callout 的规则。
-    return FwpsCalloutUnregisterById0(RuntimeId);
-    // 调用方必须检查结果：注销失败时不能释放设备或卸载驱动。
+    if (!gCalloutRegistered) return STATUS_SUCCESS;
+    NTSTATUS status = FwpsCalloutUnregisterById0(gCalloutId);
+    if (NT_SUCCESS(status)) gCalloutRegistered = FALSE;
+    return status; // 失败时保留代码和设备，不得直接卸载。
+    // ...：省略设备创建、控制请求分派与审计输出；成功注销后由拥有者删除设备。
 }
 ```
 
-运行时注册本身不创建匹配规则；结构、函数版本后缀必须成套使用。[运行时注册](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutregister0)、[六参数分类签名](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nc-fwpsk-fwps_callout_classify_fn0)、[通知签名](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nc-fwpsk-fwps_callout_notify_fn0)
+WFP 允许某些无动作写权限情况下把此前 `PERMIT` 否决成 `BLOCK`；本例没有实现该策略。普通阻断无需附加 `ABSORB` 标志。[分类函数签名](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nc-fwpsk-fwps_callout_classify_fn0)、[动作权限](https://learn.microsoft.com/en-us/windows/win32/api/fwpstypes/ns-fwpstypes-fwps_classify_out0)。
 
-`service/wfp_policy.c` 在运行时注册成功后调用以下 Win32 C 入口：传入目标程序的完整路径、与驱动一致的 Callout GUID、自有 Sublayer GUID 和选定权重。成功后保留 `Engine`，策略才持续有效。
+## 管理规则与会话生命周期
+
+下面是独立用户态 C 机制节选。入口条件：`Engine` 由 `FwpmEngineOpen0` 使用 `FWPM_SESSION_FLAG_DYNAMIC` 创建，当前没有事务；`AppId` 由 `FwpmGetAppIdFromFileName0` 为实验客户端取得；`CalloutKey` 与运行时注册一致，`SublayerKey` 是项目自己的另一个 GUID。运行时 Callout 先注册成功，再安装此规则。省略服务启动、GUID 定义和参数读取，保留匹配、绑定、事务及清理。
 
 ```c
 #include <windows.h>
-#include <initguid.h>               // 本翻译单元实例化后续 WFP GUID 常量
+#include <initguid.h> // 本翻译单元定义后续 WFP GUID 常量。
 #include <fwpmu.h>
 #pragma comment(lib, "Fwpuclnt.lib")
 
-DWORD StartConnectRule(
-    PCWSTR AppPath, const GUID *CalloutKey, const GUID *SublayerKey,
-    UINT16 SublayerWeight, HANDLE *Engine)
+DWORD InstallRule(HANDLE Engine, FWP_BYTE_BLOB *AppId,
+                  const GUID *CalloutKey, const GUID *SublayerKey)
 {
-    FWPM_SESSION0 session = {0};
+    WCHAR label[] = L"EdrLab IPv4 connect";
     FWPM_SUBLAYER0 sublayer = {0};
     FWPM_CALLOUT0 callout = {0};
     FWPM_FILTER_CONDITION0 condition = {0};
     FWPM_FILTER0 filter = {0};
-    FWP_BYTE_BLOB *appId = NULL;
-    HANDLE engine = NULL;
-    WCHAR name[] = L"EdrLab application rule";
-    DWORD error, closeError;
-    *Engine = NULL;
-
-    session.flags = FWPM_SESSION_FLAG_DYNAMIC;
-    error = FwpmEngineOpen0(NULL, RPC_C_AUTHN_WINNT, NULL, &session, &engine);
-    if (error != ERROR_SUCCESS)
-        return error;               // 用户态返回 DWORD，不使用 NT_SUCCESS
-
-    error = FwpmGetAppIdFromFileName0(AppPath, &appId);
-    if (error != ERROR_SUCCESS)
-        goto failed;
-
     sublayer.subLayerKey = *SublayerKey;
-    sublayer.displayData.name = name;
-    sublayer.weight = SublayerWeight;
+    sublayer.displayData.name = label;
+    sublayer.weight = 0x100; // 实验权重，生产策略须考虑与其他子层的仲裁。
     callout.calloutKey = *CalloutKey;
-    callout.displayData.name = name;
+    callout.displayData.name = label;
     callout.applicableLayer = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
-
     condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
     condition.matchType = FWP_MATCH_EQUAL;
     condition.conditionValue.type = FWP_BYTE_BLOB_TYPE;
-    condition.conditionValue.byteBlob = appId;
-    filter.displayData.name = name;
+    condition.conditionValue.byteBlob = AppId;
+    filter.displayData.name = label;
     filter.layerKey = callout.applicableLayer;
     filter.subLayerKey = *SublayerKey;
-    filter.weight.type = FWP_EMPTY; // 由引擎分配过滤器权重
+    filter.weight.type = FWP_EMPTY;
     filter.numFilterConditions = 1;
     filter.filterCondition = &condition;
-    filter.action.type = FWP_ACTION_CALLOUT_UNKNOWN; // 支持 BLOCK / CONTINUE
-    filter.action.calloutKey = *CalloutKey;
-    filter.rawContext = 1;          // 原样传给驱动的 Filter->context
+    filter.action.type = FWP_ACTION_CALLOUT_TERMINATING;
+    filter.action.calloutKey = *CalloutKey; // 规则实际连接到前面的内核回调。
 
-    error = FwpmTransactionBegin0(engine, 0);
-    if (error != ERROR_SUCCESS)
-        goto failed;
-    error = FwpmSubLayerAdd0(engine, &sublayer, NULL);
-    if (error != ERROR_SUCCESS)
-        goto rollback;
-    error = FwpmCalloutAdd0(engine, &callout, NULL, NULL);
-    if (error != ERROR_SUCCESS)
-        goto rollback;
-    error = FwpmFilterAdd0(engine, &filter, NULL, NULL);
-    if (error != ERROR_SUCCESS)
-        goto rollback;
-    error = FwpmTransactionCommit0(engine);
-    if (error != ERROR_SUCCESS)
-        goto rollback;
-
-    FwpmFreeMemory0((void **)&appId); // 添加接口已消费输入
-    *Engine = engine;               // 会话所有权交给调用方
-    return ERROR_SUCCESS;
-
+    DWORD error = FwpmTransactionBegin0(Engine, 0);
+    if (error != ERROR_SUCCESS) return error;
+    error = FwpmSubLayerAdd0(Engine, &sublayer, NULL);
+    if (error != ERROR_SUCCESS) goto rollback;
+    error = FwpmCalloutAdd0(Engine, &callout, NULL, NULL);
+    if (error != ERROR_SUCCESS) goto rollback;
+    error = FwpmFilterAdd0(Engine, &filter, NULL, NULL);
+    if (error != ERROR_SUCCESS) goto rollback;
+    error = FwpmTransactionCommit0(Engine);
+    if (error == ERROR_SUCCESS) return ERROR_SUCCESS; // 保持动态会话继续生效。
 rollback:
-    FwpmTransactionAbort0(engine);
-failed:
-    if (appId != NULL)
-        FwpmFreeMemory0((void **)&appId);
-    closeError = FwpmEngineClose0(engine); // 动态对象随会话清理
-    if (closeError != ERROR_SUCCESS)
-        *Engine = engine;           // 清理失败也交还句柄，由调用方重试关闭
-    return error;
+    // 单次 Add 失败不会自动撤销此前 Add；显式中止，保留最初安装错误。
+    FwpmTransactionAbort0(Engine);
+    return error; // 调用方失败时关闭此专用动态会话；关闭也会中止未决事务。
 }
 
-DWORD StopConnectRule(HANDLE *Engine)
+DWORD ReleaseRuleResources(HANDLE *Engine, FWP_BYTE_BLOB **AppId)
 {
-    DWORD error = FwpmEngineClose0(*Engine); // 成功建立会话后调用
-    if (error == ERROR_SUCCESS)
-        *Engine = NULL;
-    return error;                   // 成功后再协调驱动注销运行时 Callout
+    // AppId 的借用已结束；规则提交后，释放这份查询结果不撤销 Filter。
+    if (*AppId != NULL) {
+        FwpmFreeMemory0((void **)AppId);
+        *AppId = NULL; // 关闭会话失败后重试，不再次释放这份内存。
+    }
+    if (*Engine == NULL) return ERROR_SUCCESS;
+    DWORD error = FwpmEngineClose0(*Engine); // 结束动态会话，删除会话内管理对象。
+    if (error == ERROR_SUCCESS) *Engine = NULL;
+    return error; // 关闭未确认成功时，管理路径不得继续注销运行时 Callout。
+    // ...：省略服务主循环；成功安装时仅在策略撤销时调用本函数。
 }
 ```
 
-应用标识的分配与释放、动态会话、上下文与动作依据：[应用标识](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmgetappidfromfilename0)、[会话生命周期](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmengineopen0)、[Filter 与 rawContext](https://learn.microsoft.com/en-us/windows/win32/api/fwpmtypes/ns-fwpmtypes-fwpm_filter0)、[Callout 动作类型](https://learn.microsoft.com/en-us/windows/win32/api/fwpstypes/ns-fwpstypes-fwps_action0)。生产服务还需处理 BFE 重启、清理失败与规则重建。
+用户态管理 API 返回 `DWORD`，使用 `ERROR_SUCCESS` 判断；内核运行时 API 返回 `NTSTATUS`。调用方在安装失败时释放上述资源，成功时保留会话至撤销策略；清理失败应保留状态并完成关闭，不能把失败当成规则已消失。[动态对象与事务](https://learn.microsoft.com/en-us/windows/win32/fwp/object-management)、[应用标识](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmgetappidfromfilename0)、[释放 WFP 内存](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmfreememory0)、[关闭引擎](https://learn.microsoft.com/en-us/windows/win32/api/fwpmu/nf-fwpmu-fwpmengineclose0)。
 
-## 过滤层与撤销边界
-
-| 层 | 关注内容 |
-|---|---|
-| `ALE_AUTH_CONNECT_V4/V6` | 出站授权 |
-| `ALE_AUTH_RECV_ACCEPT_V4/V6` | 入站接收或连接接受授权 |
-| `ALE_FLOW_ESTABLISHED_V4/V6` | 已建立流的关联 |
-| `STREAM_V4/V6` | TCP 数据流 |
-| `DATAGRAM_DATA_V4/V6` | 数据报处理 |
-| Transport / IP Packet | 传输层或 IP 包处理 |
-
-例子只覆盖目标应用的 IPv4 出站授权。IPv6、已有连接、重新授权与流检查需分别设计；`layerData` 的类型随层变化。读取进程 ID 前必须检查 `FWPS_METADATA_FIELD_PROCESS_ID` 是否存在，当前分类线程不一定属于发起应用。[过滤层](https://learn.microsoft.com/en-us/windows/win32/fwp/management-filtering-layer-identifiers-)
-
-撤销动态会话只删除管理对象，仍需注销运行时 Callout。遗留 `CALLOUT_TERMINATING/UNKNOWN` Filter 在 Callout 未注册时通常按阻断处理；存在关联流上下文时注销可能返回 `STATUS_DEVICE_BUSY`，必须先移除上下文并完成注销才能卸载。[注销约束](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutunregisterbyid0)
+这条规则仅针对指定应用的 IPv4 出站授权。IPv6 要建立对应规则；已有连接、重新授权、TCP 流内容处理也有各自生命周期。撤销时先移除管理规则，再注销运行时 Callout，最后释放驱动设备；如果仍有终止型 Filter 引用已注销的 Callout，它可能按阻断处理。扩展流上下文后，注销可能返回 `STATUS_DEVICE_BUSY`，必须移除相关上下文并完成注销后才能卸载。[运行时注销约束](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutunregisterbyid0)。
 
 # 其他内核通知
 
-这些接口辅助所属子系统的生命周期管理，不承担五类主机制的全部职责。
+这些接口补充系统生命周期信息，各有对象与退出约定，不承担前述主监控面的全部职责。
 
-| 接口 | 事件对象 | 对应退出方式或边界 |
-|---|---|---|
-| `ExRegisterCallback` | 回调对象 | `ExUnregisterCallback` |
+| 接口 | 关注范围与边界 | 配对退出 |
+| --- | --- | --- |
+| `ExRegisterCallback` | 回调对象上的通知 | `ExUnregisterCallback` |
 | `IoRegisterPlugPlayNotification` | 即插即用事件 | `IoUnregisterPlugPlayNotificationEx` |
-| `IoRegisterFsRegistrationChange` | 文件系统注册状态 | `IoUnregisterFsRegistrationChange` |
+| `IoRegisterFsRegistrationChange` | 文件系统注册状态，不是逐次文件访问 | `IoUnregisterFsRegistrationChange` |
 | `PoRegisterPowerSettingCallback` | 电源设置变化 | `PoUnregisterPowerSettingCallback` |
-| `SeRegisterLogonSessionTerminatedRoutine` | 登录会话终止 | `SeUnregisterLogonSessionTerminatedRoutine`；最后一个关联令牌引用消失后触发。 |
-| `IoRegisterShutdownNotification` | 设备关机请求 | `IoUnregisterShutdownNotification`；处理 `IRP_MJ_SHUTDOWN`。 |
-| `KeRegisterBugCheckReasonCallback` | 系统崩溃阶段 | `KeDeregisterBugCheckReasonCallback`；严格受限的崩溃上下文。 |
+| `SeRegisterLogonSessionTerminatedRoutine` | 登录会话最后一个令牌引用消失后的终止 | `SeUnregisterLogonSessionTerminatedRoutine` |
+| `IoRegisterShutdownNotification` | 为设备注册 `IRP_MJ_SHUTDOWN` 处理 | `IoUnregisterShutdownNotification` |
+| `KeRegisterBugCheckReasonCallback` | 崩溃路径中的有限处理 | `KeDeregisterBugCheckReasonCallback` |
+
+登录会话终止的时机与用户点击注销并不相同；崩溃通知也不适合用作日常采集入口。[登录会话终止](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-seregisterlogonsessionterminatedroutine)。
 
 # 回调执行与驱动生命周期
 
-## 执行上下文与事件上报
+## 执行上下文与数据所有权
 
-IRQL 与线程上下文决定可用内存、锁和 API；注册函数与回调函数的执行约束需分别核对。
+IRQL 决定当前可用的内存、同步方式与 API；`PASSIVE_LEVEL` 本身不保证可以任意阻塞。注册 API 的调用条件还须与回调的执行条件分别核对。
 
-| 回调 | 主要约束 |
-|---|---|
-| 进程 Ex、Ob Pre/Post | `PASSIVE_LEVEL`，普通内核 APC 被禁用。 |
-| 普通线程通知、Cm | 不高于 `APC_LEVEL`。 |
-| 镜像加载 | `PASSIVE_LEVEL`，临界区及 APC 约束。 |
-| Minifilter Pre/Post | 依 I/O 路径；Post 可到 `DISPATCH_LEVEL`。 |
-| WFP classify | 可到 `DISPATCH_LEVEL`，受层和数据类型限制。 |
+| 回调 | 执行约束 |
+| --- | --- |
+| 进程 Ex | `PASSIVE_LEVEL`，临界区内，普通内核 APC 禁用。 |
+| 普通线程 | `PASSIVE_LEVEL` 或 `APC_LEVEL`。 |
+| 镜像 | `PASSIVE_LEVEL`，受临界区及 APC 约束。 |
+| Ob Pre/Post | `PASSIVE_LEVEL`，普通内核 APC 禁用，任意线程上下文。 |
+| Cm | 回调为 `PASSIVE_LEVEL`；注册、名称查询 API 的最高 IRQL 另查各自文档。 |
+| Minifilter Pre | `PASSIVE_LEVEL` 或 `APC_LEVEL`；可能来自系统工作线程。 |
+| Minifilter Post | 可能达到 `DISPATCH_LEVEL`，具体操作可能有更严格保证。 |
+| WFP classify | 可能达到 `DISPATCH_LEVEL`；依网络层处理数据与元信息。 |
 
-`PASSIVE_LEVEL` 不保证可以任意阻塞；Ps/Ob 回调应及时返回，避免等待用户态服务或其他工作线程。事件归因使用接口提供的目标与请求者语义。[驱动回调最佳实践](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/windows-kernel-mode-process-and-thread-manager)
+上述约束分别见[进程通知](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex)、[线程通知](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pcreate_thread_notify_routine)、[镜像通知](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nc-ntddk-pload_image_notify_routine)、[Ob Pre](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-pob_pre_operation_callback)、[Cm 回调](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nc-wdm-ex_callback_function)、[文件 Pre](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/writing-preoperation-callback-routines)、[文件 Post](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fltkernel/nc-fltkernel-pflt_post_operation_callback)、[WFP classify](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nc-fwpsk-fwps_callout_classify_fn0)。
+
+同步路径读取已准备的策略并在当前节点返回；异步路径只携带自己拥有的数据。名称、命令行与其他嵌套缓冲区需要复制或按对应框架持有引用，不能把回调借用指针直接放入队列。事件协议应区分目标身份、实际创建者/请求者、原始请求、本地裁决、策略版本与字段缺失原因，避免把“查询失败”记成“值为空”。
+
+Ps 与 Ob 等通知应保持短小，不调用用户态服务、不做阻塞 IPC，也不等待异步工作完成。回调返回以后才得到的用户态结论，不能追溯成为这次回调的同步否决结果。[微软回调最佳实践](https://learn.microsoft.com/zh-cn/windows-hardware/drivers/kernel/windows-kernel-mode-process-and-thread-manager)。
+
+## 初始化、失败回滚与卸载
+
+各节入口已展示本模块注册、失败释放与注销。跨模块协调应维护逐项成功状态：先准备策略、锁、队列，再开放回调；某一步失败，只回滚已成功资源。注销返回失败时，代码、上下文和设备仍需保持有效。
 
 ```mermaid
-flowchart LR
-    E["内核事件"] --> C["回调：读取本地策略"]
-    C --> R["同步裁决并返回"]
-    C --> Q["复制自有字段 → 有界队列"]
-    Q --> W["工作线程"] --> S["用户态服务：持久化与分析"]
-    S -->|"后续事件使用"| P["新策略快照"]
-    P --> C
+flowchart TD
+    A[进入停止状态] --> B[停止新控制请求与自有任务入队]
+    B --> C[撤销外部策略并停止事件入口]
+    C --> D[按框架完成挂起请求与在途回调]
+    D --> E[排空自建队列与工作项]
+    E --> F[释放对象引用、策略、端口与设备]
+    F --> G[允许卸载代码]
+    C -->|注销失败| H[保留资源并完成失败处理]
+    H --> C
 ```
 
-队列必须持有自有数据；对象引用遵守对应框架规则。消息应区分目标身份、实际执行上下文、原始请求、裁决、策略版本及字段缺失原因；队列满时按预定策略丢弃或降级并计数。服务稍后的判断无法追溯改写已返回的 Ps/Ob 裁决。
+图表示资源依赖；具体先后须服从框架。Minifilter 通过 `FilterUnloadCallback` 接入统一清理；有挂起请求时，要保留完成请求所依赖的工作者。WFP 管理面与运行时分开撤销。注销回调完成后，自建队列仍需独立排空。[Minifilter 加载与卸载](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/loading-and-unloading)、[WFP 注销](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/fwpsk/nf-fwpsk-fwpscalloutunregisterbyid0)。
 
-## 初始化与统一退出
-
-先准备共享状态，再注册模块，最后开放控制入口；只回滚已经成功的注册。各代码块的 Stop 是模块级清理，组合工程需要由同一个生命周期协调者调用，并把 Minifilter 卸载回调接入该退出路径。
-
-退出时阻止新控制请求和自有任务，按框架依赖完成挂起请求、注销来源、等待回调与工作项，再释放配置、对象引用、队列和设备。注销回调不会替驱动排空自建队列；注销失败也不能继续释放驱动代码。Ps/Cm 注销必须在自身回调之外进行。[Cm 注销](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-cmunregistercallback)
-
-## 用户态通信
-
-设备控制接口与 Minifilter 通信端口需检查调用权限、长度、对象范围和状态；接口不应暴露通用内核地址读写或任意函数调用。服务断开、重启及策略更新失败时，执行预先定义的本地失败策略，避免无限期等待服务。
+控制接口应只接受经过访问控制、长度与状态校验的有限请求。Minifilter 可使用通信端口；普通驱动可采用受限设备控制接口。通用内核地址读写或任意函数调用不应作为 EDR 调试协议暴露。
 
 # 运行与验证
 
-以下是测试设计及待执行命令，未在本机安装、运行或加载驱动。
+## 实验输入与预期结果
 
-## 实验路径
+先补齐工程、签名、实例配置、受限控制接口和事件消费，再在可恢复虚拟机中建立观测基线，逐项启用策略。以下是验证设计，**不是本次实测结果**。
 
-在测试虚拟机补齐工程、签名、INF 和控制入口后，先建立放行基线，再依次启用 Ps 路径拒绝、Ob 目标保护、Cm 测试键、文件路径规则及 WFP 应用规则。
+| 输入 | 预期断言 |
+| --- | --- |
+| 启动/退出 `LabTarget.exe` | 进程事件可关联，父进程与实际创建者字段分开；名称缺失路径有独立记录。 |
+| 启用进程名称规则后创建匹配目标 | `CreationStatus` 被设为失败；不把其他失败状态恢复成成功。 |
+| `LabCaller.exe` 打开或复制目标句柄 | 新句柄经过 Ob；验证实际授权及后续操作，区分复制源、接收方与目标对象。 |
+| 使用策略启用前取得的句柄 | 单独观察已有授权，不按新句柄裁剪的结果推断。 |
+| 对 `\REGISTRY\MACHINE\SOFTWARE\EdrLab` 设置/删除值、删除键或重命名 | 命中 Pre 后失败，拒绝计数当场增加；不等待对应 Post。 |
+| 操作其他键、创建/打开键、制造名称查询失败 | 分别验证范围外放行和声明的 fail-open。 |
+| 打开指定实验文件 | 目标卷存在实例、名称匹配时拒绝；已有句柄、重命名、映射等另测。 |
+| `LabClient.exe` 发起新的 IPv4 出站连接 | 核对 AppId、Layer、Sublayer、CalloutKey 与 Filter 动作；IPv6、已有连接另测。 |
+| 关闭动态网络会话并停止驱动 | 管理规则撤销、运行时注销成功，没有残留规则继续阻断。 |
 
-| 测试对象 | 核心断言 |
-|---|---|
-| 新进程及退出 | 创建者与父进程分开记录；Ex 拒绝使创建失败。 |
-| 新建、复制与已有进程句柄 | 核对实际授权和被移除权限对应操作；已有句柄单独验证。 |
-| 测试键的四类写操作 | 拒绝后无该次修改；本过滤器拒绝的操作没有对应 Post。 |
-| 目标文件与目标卷 | Instance 已附加；Create 拒绝与名称查询失败放行分别验证。 |
-| 目标应用的网络请求 | IPv4、IPv6及已有连接分别测试；动态会话撤销后无遗留规则。 |
-| 注册失败、并发与反复退出 | 已成功资源回滚；无重复完成、泄漏或注销失败后卸载。 |
+## 状态检查与异常定位
 
-## 实例、规则与驱动检查
-
-只在已部署实验驱动的测试虚拟机中执行：
+仅在已经安装实验组件的测试机管理员终端使用以下命令。本次没有执行它们。
 
 ```powershell
-# Filter 注册与目标卷 Instance 附加是两个检查点。
-fltmc filters
-fltmc instances
-fltmc volumes
-
-# 核对层、子层、Callout GUID 和应用条件。
-netsh wfp show state file=wfpstate.xml
-
-# Verifier 会主动暴露驱动错误，可能触发蓝屏；仅针对自己的实验驱动。
-verifier /standard /driver EdrLab.sys
-# 按要求重启并执行测试后检查配置。
-verifier /querysettings
-# 实验结束清除配置，随后重启。
-verifier /reset
+fltmc filters       # 过滤器是否存在
+fltmc instances     # 目标卷是否有实例
+fltmc volumes       # 卷与过滤支持情况
+netsh wfp show state file=wfpstate.xml  # 导出层、规则与 Callout 绑定供核对
 ```
 
-命令与实验准备依据：[Minifilter 开发与测试](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/development-and-testing-tools)、[netsh wfp](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netsh-wfp)、[Driver Verifier](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/driver-verifier)
+文件过滤检查要分别确认注册、实例附加及操作类型；网络检查要分别确认运行时与管理规则。[Minifilter 运行管理](https://learn.microsoft.com/en-us/windows-hardware/drivers/ifs/loading-and-unloading)、[netsh wfp](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/netsh-wfp)。
 
-出现行为但缺少预期事件时，依次检查注册结果、实例或规则、语义覆盖、事件发生时机、字段查询、队列及策略版本。压力测试还应覆盖服务断开、队列上限、挂起请求取消和卸载；“没有日志”本身不足以判定回调被绕过。
+| 异常方向 | 检查内容 |
+| --- | --- |
+| 无预期事件 | 注册结果、附加/规则、事件语义、是否早于注册或使用已有资源。 |
+| 字段或记录缺失 | 查询与复制失败、队列溢出、服务断开、名称空间与目标身份。 |
+| 并发与策略更新 | 共享状态竞争、旧快照寿命、不可控内存增长、延迟。 |
+| 初始化中途失败 | 仅清理已成功项，注销错误不被吞掉，无残留入口。 |
+| 有挂起 I/O 或流上下文时退出 | 唯一完成责任，忙状态正确处理，代码释放晚于最后使用者。 |
+| 反复启动、停止、服务重启 | 无重复注册、泄漏、悬空指针；失败策略与设计一致。 |
+
+日志缺失需要沿这些环节定位，不能直接推断回调机制被破坏；驱动加载成功也不足以证明监控覆盖或稳定性。驱动层防护依赖系统完整性与自身接口安全，不能单靠一个 Ob 回调形成全部自保护能力。
+
+在可恢复实验虚拟机中，可仅对自己的实验驱动启用 Driver Verifier；按要求重启、运行测试并检查转储。它可能主动触发系统崩溃以暴露违规。[Driver Verifier](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/driver-verifier)。
+
+```powershell
+verifier /standard /driver EdrLab.sys
+verifier /querysettings
+# 完成实验后清除设置，再按要求重启。
+verifier /reset
+```

@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-20T07:10:13.304147+00:00",
+  "checked_at": "2026-09-20T07:38:21.069895+00:00",
   "passed": true,
   "checks": {
     "prompt_sync": "9 sources match both YAML files; 10 unique triggers",
@@ -53,9 +53,9 @@
     ],
     "edr_expression": {
       "source_characters": 34348,
-      "result_characters": 26445,
+      "result_characters": 33983,
       "source_cjk": 10851,
-      "result_cjk": 4401,
+      "result_cjk": 6134,
       "core_control_terms_retained": 8,
       "scope": "Presence and structure checks; semantic correctness requires review."
     },
@@ -64,18 +64,19 @@
         "fences": {
           "mermaid": 3,
           "text": 1,
-          "c": 6,
-          "powershell": 1
+          "c": 7,
+          "powershell": 2
         },
         "implementation_lines": [
-          44,
-          101,
-          93,
-          71,
           51,
-          88
+          42,
+          94,
+          97,
+          68,
+          52,
+          61
         ],
-        "prose_cjk": 3329,
+        "prose_cjk": 4844,
         "scope": "Presentation metrics and obvious-placeholder checks; not compilation or semantic proof."
       },
       "ai-game-development.md": {
