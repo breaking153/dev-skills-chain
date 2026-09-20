@@ -1,0 +1,49 @@
+{
+  "checked_at": "2026-09-20T03:35:38.873276+00:00",
+  "passed": true,
+  "checks": {
+    "prompt_sync": "9 sources match both YAML files; 10 unique triggers",
+    "ai-game-development.md": [
+      "概念",
+      "开发环境",
+      "项目结构",
+      "AI 辅助开发与资源制作",
+      "运行时行为",
+      "对话服务接入",
+      "运行与验证"
+    ],
+    "ai-game-completed.md": [
+      "概念",
+      "项目结构",
+      "运行与验证"
+    ],
+    "ai-game-backend-prompt.md": [
+      "概念",
+      "开发环境",
+      "项目结构",
+      "资源制作",
+      "运行时行为",
+      "对话服务",
+      "运行与验证"
+    ],
+    "ai-game-history-synthesis.md": [
+      "概念",
+      "项目结构",
+      "运行时协作",
+      "运行与验证"
+    ],
+    "history_synthesis": "8 source questions are not repeated; no Q/A packaging",
+    "completion_preservation": "Original headings, order and WikiLink retained",
+    "canvas": {
+      "nodes": 13,
+      "groups": 3,
+      "edges": 0
+    },
+    "espanso_cli": {
+      "exit_code": 0,
+      "matched_prompt_bodies": 9
+    },
+    "espanso_service": "espanso is running"
+  },
+  "limits": "Structural checks only; semantic review is in validation-report.md. No target-app typing or Obsidian visual check."
+}
