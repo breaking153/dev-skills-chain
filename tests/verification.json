@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-20T06:57:48.477043+00:00",
+  "checked_at": "2026-09-20T07:10:13.304147+00:00",
   "passed": true,
   "checks": {
     "prompt_sync": "9 sources match both YAML files; 10 unique triggers",
