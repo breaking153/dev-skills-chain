@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-20T03:35:38.873276+00:00",
+  "checked_at": "2026-09-20T04:22:54.245011+00:00",
   "passed": true,
   "checks": {
     "prompt_sync": "9 sources match both YAML files; 10 unique triggers",
@@ -38,6 +38,27 @@
       "nodes": 13,
       "groups": 3,
       "edges": 0
+    },
+    "edr-driver-knowledge.md": [
+      "概念",
+      "开发环境",
+      "项目结构",
+      "进程、线程与镜像通知",
+      "对象句柄过滤",
+      "注册表过滤",
+      "文件系统过滤",
+      "网络过滤",
+      "其他内核通知",
+      "回调执行与驱动生命周期",
+      "运行与验证"
+    ],
+    "edr_expression": {
+      "source_characters": 34348,
+      "result_characters": 22968,
+      "source_cjk": 10851,
+      "result_cjk": 8223,
+      "core_control_terms_retained": 8,
+      "scope": "Presence and structure checks; semantic correctness requires review."
     },
     "espanso_cli": {
       "exit_code": 0,

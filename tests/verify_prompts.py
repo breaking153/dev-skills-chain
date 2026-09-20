@@ -66,6 +66,7 @@ def validate_note(path: Path) -> list[str]:
     require("**概念总结" not in text and "**Demo" not in text, "Repeated card labels")
     require(not re.search(r"(?m)^\s*(?:#{1,6}\s+)?(?:问题[一二三四五六七八九十\d]+|问\s*[:：]|答\s*[:：]|Q\d*\s*[:：]|A\d*\s*[:：])", text), "Question-and-answer packaging")
     require("TODO" not in text and "<!-- STRUCTURE_CONTRACT -->" not in text, "Unexpanded content")
+    require(":chatgpt-content-reference{" not in text, f"Unresolved source placeholder: {path.name}")
     return top
 
 
@@ -155,6 +156,21 @@ def main() -> None:
     require(indexes == sorted(indexes), "Original heading order changed")
     results["completion_preservation"] = "Original headings, order and WikiLink retained"
     results["canvas"] = validate_canvas(ROOT / "tests/outputs/ai-game-development.canvas")
+    edr_path = ROOT / "tests/outputs/edr-driver-knowledge.md"
+    results[edr_path.name] = validate_note(edr_path)
+    edr = edr_path.read_text(encoding="utf-8")
+    original_edr = (ROOT / "tests/inputs/edr-draft.md").read_text(encoding="utf-8")
+    core_terms = ("CreationStatus", "DesiredAccess", "OB_PREOP_SUCCESS", "STATUS_CALLBACK_BYPASS",
+                  "FltRegisterFilter", "FltStartFiltering", "FLT_PREOP_COMPLETE", "FWPS_RIGHT_ACTION_WRITE")
+    require(all(term in edr for term in core_terms), "EDR refinement dropped a core control mechanism")
+    require(len(edr) < len(original_edr), "EDR refinement did not reduce source length")
+    results["edr_expression"] = {
+        "source_characters": len(original_edr), "result_characters": len(edr),
+        "source_cjk": len(re.findall(r"[\u4e00-\u9fff]", original_edr)),
+        "result_cjk": len(re.findall(r"[\u4e00-\u9fff]", edr)),
+        "core_control_terms_retained": len(core_terms),
+        "scope": "Presence and structure checks; semantic correctness requires review.",
+    }
     if args.espanso:
         listed = subprocess.run([str(args.espanso), "match", "list", "--json"], capture_output=True, text=True, encoding="utf-8", timeout=20, check=True)
         runtime = json.loads(listed.stdout)

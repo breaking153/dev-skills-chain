@@ -4,6 +4,8 @@
 
 历史提问只作为知识需求来源：提取概念与机制，去重归类后输出体系化知识。不会按提问顺序逐题回答，也不会让每个追问各占一个章节。
 
+v6 进一步区分知识包含关系与调用、引用、执行顺序：注册和生命周期等共用机制归入所属模块，正文先说明职责与行为，再交代必要条件。精简重复提醒、写作旁白和代码复述，保留控制语义与失败行为。
+
 | Espanso 快捷词 | 可独立复制的 Prompt | 用途 |
 | --- | --- | --- |
 | `/shuli` | [knowledge/shuli.md](knowledge/shuli.md) | 从主题、会话或资料生成技术笔记 |
@@ -31,6 +33,8 @@
 ## 验证
 
 [AI 游戏开发试跑笔记](tests/outputs/ai-game-development.md) 是 `/shuli` 的生成与复核示例，另有补全、后端 Prompt 知识分流和 Canvas 试跑；[历史提问归类示例](tests/outputs/ai-game-history-synthesis.md) 专门验证零散追问能否整理成体系。范围与结果见 [测试报告](tests/validation-report.md)。
+
+[EDR 驱动层精简稿](tests/outputs/edr-driver-knowledge.md) 用于验证 v6 的知识归属与表达规则；原稿和本次整理请求分别保存在 `tests/inputs/edr-draft.md`、`tests/inputs/edr-expression-request.md`。
 
 本次本地环境已有 Python 和 PyYAML。修改任一源 Prompt 后，需要同步仓库 `base.yml` 与实际使用的 Espanso `match/base.yml` 对应 `replace`；不能只修改其中一份。执行以下只读检查可发现不同步、无效层级或 Canvas 结构问题：
 
