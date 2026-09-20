@@ -70,6 +70,42 @@ def validate_note(path: Path) -> list[str]:
     return top
 
 
+def codefirst_metrics(path: Path) -> dict:
+    """Describe the current trials; these counts do not prove code correctness."""
+    text = path.read_text(encoding="utf-8")
+    blocks = []
+    prose = []
+    fence = None
+    language = ""
+    body = []
+    for line in text.splitlines():
+        marker = re.match(r"^\s{0,3}(`{3,}|~{3,})(.*)$", line)
+        if marker:
+            chars, suffix = marker.groups()
+            if fence is None:
+                fence, language, body = chars, suffix.strip().lower(), []
+                continue
+            if chars[0] == fence[0] and len(chars) >= len(fence) and not suffix.strip():
+                blocks.append((language, "\n".join(body)))
+                fence = None
+                continue
+        (body if fence else prose).append(line)
+    require(fence is None, f"Unclosed trial code: {path.name}")
+    require(all(lang not in {"pseudo", "pseudocode"} for lang, _ in blocks),
+            f"Pseudocode fence in current trial: {path.name}")
+    implementations = [(lang, code) for lang, code in blocks if lang in {"c", "javascript", "js"}]
+    require(implementations, f"Missing real implementation example: {path.name}")
+    for _, code in implementations:
+        require(not re.search(r"(?m)^\s*(?:\.\.\.|…|TODO)\s*;?\s*$", code),
+                f"Unimplemented code placeholder: {path.name}")
+    return {
+        "fences": {lang: sum(other == lang for other, _ in blocks) for lang, _ in blocks},
+        "implementation_lines": [len(code.splitlines()) for _, code in implementations],
+        "prose_cjk": len(re.findall(r"[\u4e00-\u9fff]", "\n".join(prose))),
+        "scope": "Presentation metrics and obvious-placeholder checks; not compilation or semantic proof.",
+    }
+
+
 def overlaps(a: dict, b: dict) -> bool:
     return (a["x"] < b["x"] + b["width"] and b["x"] < a["x"] + a["width"]
             and a["y"] < b["y"] + b["height"] and b["y"] < a["y"] + a["height"])
@@ -170,6 +206,10 @@ def main() -> None:
         "result_cjk": len(re.findall(r"[\u4e00-\u9fff]", edr)),
         "core_control_terms_retained": len(core_terms),
         "scope": "Presence and structure checks; semantic correctness requires review.",
+    }
+    results["v7_codefirst_trials"] = {
+        name: codefirst_metrics(ROOT / "tests/outputs" / name)
+        for name in ("edr-driver-knowledge.md", "ai-game-development.md")
     }
     if args.espanso:
         listed = subprocess.run([str(args.espanso), "match", "list", "--json"], capture_output=True, text=True, encoding="utf-8", timeout=20, check=True)

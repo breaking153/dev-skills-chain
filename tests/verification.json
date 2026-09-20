@@ -1,12 +1,11 @@
 {
-  "checked_at": "2026-09-20T04:22:54.245011+00:00",
+  "checked_at": "2026-09-20T06:57:48.477043+00:00",
   "passed": true,
   "checks": {
     "prompt_sync": "9 sources match both YAML files; 10 unique triggers",
     "ai-game-development.md": [
       "概念",
-      "开发环境",
-      "项目结构",
+      "开发路径",
       "AI 辅助开发与资源制作",
       "运行时行为",
       "对话服务接入",
@@ -54,11 +53,42 @@
     ],
     "edr_expression": {
       "source_characters": 34348,
-      "result_characters": 22968,
+      "result_characters": 26445,
       "source_cjk": 10851,
-      "result_cjk": 8223,
+      "result_cjk": 4401,
       "core_control_terms_retained": 8,
       "scope": "Presence and structure checks; semantic correctness requires review."
+    },
+    "v7_codefirst_trials": {
+      "edr-driver-knowledge.md": {
+        "fences": {
+          "mermaid": 3,
+          "text": 1,
+          "c": 6,
+          "powershell": 1
+        },
+        "implementation_lines": [
+          44,
+          101,
+          93,
+          71,
+          51,
+          88
+        ],
+        "prose_cjk": 3329,
+        "scope": "Presentation metrics and obvious-placeholder checks; not compilation or semantic proof."
+      },
+      "ai-game-development.md": {
+        "fences": {
+          "javascript": 2
+        },
+        "implementation_lines": [
+          66,
+          66
+        ],
+        "prose_cjk": 1423,
+        "scope": "Presentation metrics and obvious-placeholder checks; not compilation or semantic proof."
+      }
     },
     "espanso_cli": {
       "exit_code": 0,
